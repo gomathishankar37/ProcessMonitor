@@ -39,10 +39,15 @@ ProcessMonitor::ProcessMonitor() : mSocket(0), mListen(false), mValid(false)
     mSocket = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_CONNECTOR);
     if (mSocket < 0)
     {
-        Log("Failed to open netlink socket");
+        Log("Failed to open netlink socket with error '%s'", strerror(errno));
         return;
     }
-
+    struct timeval tval;
+    tval.tv_sec = 10;
+    tval.tv_usec = 0;
+    if (-1 == setsockopt(mSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tval, sizeof tval)) {
+	    Log("Failed to set timeout for socket '%s'", strerror(errno));
+    }
     struct sockaddr_nl sa = {};
     sa.nl_family = AF_NETLINK;
     sa.nl_groups = CN_IDX_PROC;
@@ -264,7 +269,10 @@ void ProcessMonitor::receiveMessages()
 
         if (len < 0)
         {
-            Log("Failed to receive message with error %d", errno);
+            if (EAGAIN != errno) {
+                Log("Failed to receive message with error %d", errno);
+	        }
+	        continue;
         }
 
         if (address.nl_pid != 0)
