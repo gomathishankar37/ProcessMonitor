@@ -109,7 +109,7 @@ int main(int argc, char **argv)
     Log("Output file: %s", gOutputFile.c_str());
     Log("Capture duration: %d seconds", gDurationSeconds);
 
-    signal(SIGINT, signalHandler);
+    //signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
     // Start tracking events
