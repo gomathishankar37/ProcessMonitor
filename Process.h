@@ -35,6 +35,11 @@ struct processInfo
 
     std::string systemdServiceName;
 
+    unsigned long pss = 0;              // Proportional Set Size (in kB)
+    unsigned long swapPss = 0;          // Swap Proportional Set Size (in kB)
+    unsigned long cpuTime = 0;          // CPU time (stime + utime) in clock ticks
+    unsigned long rss = 0;              // Resident Set Size (in pages, multiply by page size for bytes)
+
     /**
      * Use some heuristics to try and get a suitable name for the timeline group
      *
