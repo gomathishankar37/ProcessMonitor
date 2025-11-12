@@ -39,6 +39,9 @@ private:
 
     std::string getSystemdService(pid_t pid);
 
+    int getPSSandSwapPSS(pid_t pid, unsigned long *pssTotal, unsigned long *swappssTotal);
+    bool getCPUAndRSS(pid_t pid, unsigned long *cpuTime, unsigned long *rss, std::string &processName);
+
 private:
     int mSocket;
     bool mListen;

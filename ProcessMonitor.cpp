@@ -330,6 +330,51 @@ void ProcessMonitor::receiveMessages()
                     p.endTime = std::chrono::system_clock::now();
                     p.exitCode = ev->event_data.exit.exit_code;
 
+                    // Get process statistics
+                    unsigned long pss = 0, swapPss = 0;
+                    unsigned long cpuTime = 0, rss = 0;
+                    std::string processName;
+
+                    // Get PSS and SwapPSS from smaps
+                    if (getPSSandSwapPSS(pid, &pss, &swapPss) != 0)
+                    {
+                        // Try to get process name for logging
+                        getCPUAndRSS(pid, &cpuTime, &rss, processName);
+                        if (!processName.empty())
+                        {
+                            Log("Failed to get PSS/SwapPSS for PID %u (%s): /proc/%u/smaps not accessible", 
+                                pid, processName.c_str(), pid);
+                        }
+                        else
+                        {
+                            Log("Failed to get PSS/SwapPSS for PID %u: /proc/%u/smaps not accessible", pid, pid);
+                        }
+                    }
+                    else
+                    {
+                        p.pss = pss;
+                        p.swapPss = swapPss;
+                    }
+
+                    // Get CPU time and RSS from stat
+                    if (!getCPUAndRSS(pid, &cpuTime, &rss, processName))
+                    {
+                        if (!processName.empty())
+                        {
+                            Log("Failed to get CPU/RSS for PID %u (%s): /proc/%u/stat not accessible", 
+                                pid, processName.c_str(), pid);
+                        }
+                        else
+                        {
+                            Log("Failed to get CPU/RSS for PID %u: /proc/%u/stat not accessible", pid, pid);
+                        }
+                    }
+                    else
+                    {
+                        p.cpuTime = cpuTime;
+                        p.rss = rss;
+                    }
+
                     // Move process from running vector to exited vector
                     mExitedProcesses.insert(mExitedProcesses.end(), std::make_move_iterator(process),
                                             std::make_move_iterator(std::next(process)));
@@ -464,6 +509,14 @@ std::string ProcessMonitor::GetJson()
             process["exitCode"] = p.exitCode;
             process["systemdService"] = p.systemdServiceName;
 
+            // Add new statistics
+            process["pss"] = p.pss;
+            process["swapPss"] = p.swapPss;
+            process["cpuTime"] = p.cpuTime;
+            process["rss"] = p.rss;
+            // RSS in bytes (rss is in pages, multiply by page size)
+            process["rssBytes"] = p.rss * mPageSize;
+
             results["processes"].emplace_back(process);
 
             groups.insert(process["group"]);
@@ -540,3 +593,105 @@ std::string ProcessMonitor::getSystemdService(pid_t pid)
 
     return "None";
 }
+
+/**
+ * Get PSS and SwapPSS from /proc/<pid>/smaps
+ * Based on reference.cpp implementation
+ *
+ * @param pid Process ID
+ * @param[out] pssTotal PSS total in kB
+ * @param[out] swappssTotal SwapPSS total in kB
+ * @return 0 on success, 1 on failure
+ */
+ int ProcessMonitor::getPSSandSwapPSS(pid_t pid, unsigned long *pssTotal, unsigned long *swappssTotal)
+ {
+     char smapsPath[PATH_MAX];
+     sprintf(smapsPath, "/proc/%u/smaps", pid);
+     
+     FILE *smap = fopen(smapsPath, "r");
+     if (!smap)
+     {
+         Log("Failed to open %s for PID %u: %s", smapsPath, pid, strerror(errno));
+         return 1;
+     }
+ 
+     char line[1024];
+     unsigned long pss, swappss;
+     
+     *pssTotal = 0;
+     *swappssTotal = 0;
+ 
+     while (fgets(line, sizeof(line), smap))
+     {
+         if (sscanf(line, "Pss: %lu kB", &pss) == 1)
+         {
+             *pssTotal += pss;
+         }
+         else if (sscanf(line, "SwapPss: %lu kB", &swappss) == 1)
+         {
+             *swappssTotal += swappss;
+         }
+     }
+ 
+     fclose(smap);
+     return 0;
+ }
+ 
+ /**
+  * Get CPU time (stime + utime) and RSS from /proc/<pid>/stat
+  * Also extracts process name for logging purposes
+  *
+  * @param pid Process ID
+  * @param[out] cpuTime Total CPU time (stime + utime) in clock ticks
+  * @param[out] rss Resident Set Size in pages
+  * @param[out] processName Process name (for logging)
+  * @return true on success, false on failure
+  */
+ bool ProcessMonitor::getCPUAndRSS(pid_t pid, unsigned long *cpuTime, unsigned long *rss, std::string &processName)
+ {
+     char statPath[PATH_MAX];
+     sprintf(statPath, "/proc/%u/stat", pid);
+ 
+     FILE *fp = fopen(statPath, "r");
+     if (!fp)
+     {
+         Log("Failed to open %s for PID %u: %s", statPath, pid, strerror(errno));
+         return false;
+     }
+ 
+     char name[256];
+     unsigned long utime, stime;
+     unsigned long rssPages;
+ 
+     // Format: pid (name) state ppid ... utime stime ... rss
+     // Field positions: 1=pid, 2=name, 14=utime, 15=stime, 24=rss
+     int scanned = fscanf(fp, "%*d %255s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %*d %*d %*d %*d %*u %lu",
+                          name, &utime, &stime, &rssPages);
+ 
+     fclose(fp);
+ 
+     if (scanned >= 4)
+     {
+         // Remove parentheses from process name
+         size_t len = strlen(name);
+         if (len > 0 && name[len - 1] == ')')
+         {
+             name[len - 1] = '\0';
+         }
+         if (name[0] == '(')
+         {
+             processName = std::string(name + 1);
+         }
+         else
+         {
+             processName = std::string(name);
+         }
+ 
+         *cpuTime = utime + stime;
+         *rss = rssPages;
+         return true;
+     }
+ 
+     Log("Failed to parse %s for PID %u: only scanned %d fields", statPath, pid, scanned);
+     return false;
+ }

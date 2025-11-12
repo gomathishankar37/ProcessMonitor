@@ -92,6 +92,26 @@
                     <td>Systemd Service</td>
                     <td id="selected-process-systemd-service">-</td>
                 </tr>
+                <tr>
+                    <td>PSS (kB)</td>
+                    <td id="selected-process-pss">-</td>
+                </tr>
+                <tr>
+                    <td>SwapPSS (kB)</td>
+                    <td id="selected-process-swappss">-</td>
+                </tr>
+                <tr>
+                    <td>CPU Time (ticks)</td>
+                    <td id="selected-process-cputime">-</td>
+                </tr>
+                <tr>
+                    <td>RSS (pages)</td>
+                    <td id="selected-process-rss">-</td>
+                </tr>
+                <tr>
+                    <td>RSS (bytes)</td>
+                    <td id="selected-process-rssbytes">-</td>
+                </tr>
                 </tbody>
             </table>
         </div>
@@ -252,6 +272,12 @@
                 document.getElementById('selected-process-grandparent-comm').innerText = process.grandparentCommandLine;
                 document.getElementById('selected-process-exitcode').innerText = process.exitCode;
                 document.getElementById('selected-process-systemd-service').innerText = process.systemdService;
+
+                document.getElementById('selected-process-pss').innerText = process.pss || 0;
+                document.getElementById('selected-process-swappss').innerText = process.swapPss || 0;
+                document.getElementById('selected-process-cputime').innerText = process.cpuTime || 0;
+                document.getElementById('selected-process-rss').innerText = process.rss || 0;
+                document.getElementById('selected-process-rssbytes').innerText = process.rssBytes || 0;
             } else {
                 document.getElementById('selected-process-pid').innerText = "-";
                 document.getElementById('selected-process-name').innerText = "-";
@@ -261,6 +287,12 @@
                 document.getElementById('selected-process-grandparent-comm').innerText = "-";
                 document.getElementById('selected-process-exitcode').innerText = "-";
                 document.getElementById('selected-process-systemd-service').innerText = "-";
+
+                document.getElementById('selected-process-pss').innerText = "-";
+                document.getElementById('selected-process-swappss').innerText = "-";
+                document.getElementById('selected-process-cputime').innerText = "-";
+                document.getElementById('selected-process-rss').innerText = "-";
+                document.getElementById('selected-process-rssbytes').innerText = "-";
             }
         });
 
