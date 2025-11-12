@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <ctime>
 
 #define OP_LDH (BPF_LD | BPF_H | BPF_ABS)
 #define OP_LDB (BPF_LD | BPF_B | BPF_ABS)
@@ -32,7 +33,7 @@
  * * https://nick-black.com/dankwiki/index.php/The_Proc_Connector_and_Socket_Filters
  * * https://bewareofgeek.livejournal.com/2945.html
  */
-ProcessMonitor::ProcessMonitor() : mSocket(0), mListen(false), mValid(false)
+ProcessMonitor::ProcessMonitor() : mSocket(0), mListen(false), mValid(false), mSMapsSampleCount(0), mSMapsMissingCount(0), mStatSampleCount(0), mStatMissingCount(0)
 {
     mPageSize = sysconf(_SC_PAGESIZE);
 
@@ -116,6 +117,45 @@ bool ProcessMonitor::Stop()
     }
 
     setListenMode(false);
+    auto pct = [](std::size_t missing, std::size_t total) -> double {
+        if (total == 0) { return 0.0; }
+        return static_cast<double>(missing) * 100.0 / static_cast<double>(total);
+    };
+
+    auto formatTime = [](const std::chrono::time_point<std::chrono::system_clock> &tp) -> std::string {
+        std::time_t t = std::chrono::system_clock::to_time_t(tp);
+        char buffer[64];
+        if (std::strftime(buffer, sizeof(buffer), "%F %T", std::localtime(&t)))
+        {
+            return std::string(buffer);
+        }
+        return std::string("unknown");
+    };
+
+    const std::size_t statTotal = mStatSampleCount;
+    const std::size_t smapsTotal = mSMapsSampleCount;
+    const std::size_t statMiss = mStatMissingCount;
+    const std::size_t smapsMiss = mSMapsMissingCount;
+    const std::size_t totalAttempts = statTotal + smapsTotal;
+    const std::size_t totalMisses = statMiss + smapsMiss;
+
+    const double statLossPct = pct(statMiss, statTotal);
+    const double smapsLossPct = pct(smapsMiss, smapsTotal);
+    const double overallLossPct = pct(totalMisses, totalAttempts);
+
+    const std::size_t processesCaptured =
+        std::count_if(mExitedProcesses.begin(), mExitedProcesses.end(),
+                      [](const processInfo &p) { return !p.commandLine.empty() && p.commandLine != "Unknown"; });
+
+    Log("Start Time : %s", formatTime(mStart).c_str());
+    Log("End Time : %s", formatTime(mEnd).c_str());
+    Log("Exits Seen : %zu", mExitedProcesses.size());
+    Log("Total Processes Captured : %zu", processesCaptured);
+    Log("Process stat file miss count : %zu", statMiss);
+    Log("Process smaps file miss count : %zu", smapsMiss);
+    Log("%% of stat file miss : %.1f%%", statLossPct);
+    Log("%% of smaps file miss : %.1f%%", smapsLossPct);
+    Log("Lossiness %% : %.1f%%", overallLossPct);
 
     return true;
 }
@@ -291,100 +331,82 @@ void ProcessMonitor::receiveMessages()
 
             switch (ev->what)
             {
-            case proc_event::PROC_EVENT_EXEC:
-            {
-                // Process has started
-                processInfo info{};
-
-                info.pid = ev->event_data.exec.process_pid;
-                info.parentPid = getParentPid(info.pid);
-                info.grandparentPid = getParentPid(info.parentPid);
-
-                // This isn't going to be 100% accurate but close enough
-                info.startTime = std::chrono::system_clock::now();
-
-                getProcessCommandLine(info.pid, info.commandLine);
-                getProcessCommandLine(info.parentPid, info.parentCommandLine);
-                getProcessCommandLine(info.grandparentPid, info.grandparentCommandLine);
-
-                info.systemdServiceName = getSystemdService(info.pid);
-
-                mRunningProcesses.emplace_back(info);
-                break;
-            }
-            case proc_event::PROC_EVENT_EXIT:
-            {
-                // Process has exited
-
-                pid_t pid = ev->event_data.exit.process_pid;
-
-                auto process = std::find_if(mRunningProcesses.begin(), mRunningProcesses.end(),
-                                            [pid](const processInfo &pi) { return pi.pid == pid; });
-
-                // Are we tracking this process?
-                if (process != mRunningProcesses.end())
+                case proc_event::PROC_EVENT_EXEC:
                 {
-                    auto &p = (*process);
+                    // Process has started
+                    processInfo info{};
 
-                    // Update process with the exit time and code
-                    p.endTime = std::chrono::system_clock::now();
-                    p.exitCode = ev->event_data.exit.exit_code;
+                    info.pid = ev->event_data.exec.process_pid;
+                    info.parentPid = getParentPid(info.pid);
+                    info.grandparentPid = getParentPid(info.parentPid);
 
-                    // Get process statistics
-                    unsigned long pss = 0, swapPss = 0;
-                    unsigned long cpuTime = 0, rss = 0;
-                    std::string processName;
+                    // This isn't going to be 100% accurate but close enough
+                    info.startTime = std::chrono::system_clock::now();
 
-                    // Get PSS and SwapPSS from smaps
-                    if (getPSSandSwapPSS(pid, &pss, &swapPss) != 0)
-                    {
-                        // Try to get process name for logging
-                        getCPUAndRSS(pid, &cpuTime, &rss, processName);
-                        if (!processName.empty())
-                        {
-                            Log("Failed to get PSS/SwapPSS for PID %u (%s): /proc/%u/smaps not accessible", 
-                                pid, processName.c_str(), pid);
-                        }
-                        else
-                        {
-                            Log("Failed to get PSS/SwapPSS for PID %u: /proc/%u/smaps not accessible", pid, pid);
-                        }
-                    }
-                    else
-                    {
-                        p.pss = pss;
-                        p.swapPss = swapPss;
-                    }
+                    getProcessCommandLine(info.pid, info.commandLine);
+                    getProcessCommandLine(info.parentPid, info.parentCommandLine);
+                    getProcessCommandLine(info.grandparentPid, info.grandparentCommandLine);
 
-                    // Get CPU time and RSS from stat
-                    if (!getCPUAndRSS(pid, &cpuTime, &rss, processName))
-                    {
-                        if (!processName.empty())
-                        {
-                            Log("Failed to get CPU/RSS for PID %u (%s): /proc/%u/stat not accessible", 
-                                pid, processName.c_str(), pid);
-                        }
-                        else
-                        {
-                            Log("Failed to get CPU/RSS for PID %u: /proc/%u/stat not accessible", pid, pid);
-                        }
-                    }
-                    else
-                    {
-                        p.cpuTime = cpuTime;
-                        p.rss = rss;
-                    }
+                    info.systemdServiceName = getSystemdService(info.pid);
 
-                    // Move process from running vector to exited vector
-                    mExitedProcesses.insert(mExitedProcesses.end(), std::make_move_iterator(process),
-                                            std::make_move_iterator(std::next(process)));
-                    mRunningProcesses.erase(process);
+                    mRunningProcesses.emplace_back(info);
+                    break;
                 }
+                
+                case proc_event::PROC_EVENT_EXIT:
+                {
+                    pid_t pid = ev->event_data.exit.process_pid;
+                    auto process = std::find_if(mRunningProcesses.begin(), mRunningProcesses.end(), [pid](const processInfo &p) { return p.pid == pid; });
+                    if (process != mRunningProcesses.end())
+                    {
+                        auto &p = (*process);
+                        p.endTime = std::chrono::system_clock::now();
+                        p.exitCode = ev->event_data.exit.exit_code;
 
-                break;
-            }
-            default:
-                break;
+                        unsigned long pss = 0, swapPss = 0;
+                        unsigned long cpuTime = 0, rss = 0;
+                        std::string processName;
+
+                        // Capture CPU/RSS first so we have the name for logging
+                        mStatSampleCount++;
+                        bool cpuOk = getCPUAndRSS(pid, &cpuTime, &rss, processName);
+                        if (cpuOk)
+                        {
+                            p.cpuTime = cpuTime;
+                            p.rss = rss;
+                        }
+                        else
+                        {
+                            mStatMissingCount++;
+                        }
+
+                        mSMapsSampleCount++;
+                        if (getPSSandSwapPSS(pid, &pss, &swapPss) != 0)
+                        {
+                            mSMapsMissingCount++;
+                            if (!processName.empty())
+                            {
+                                Log("Failed to get PSS/SwapPSS for PID %u (%s): /proc/%u/smaps not accessible",
+                                    pid, processName.c_str(), pid);
+                            }
+                            else
+                            {
+                                Log("Failed to get PSS/SwapPSS for PID %u: /proc/%u/smaps not accessible", pid, pid);
+                            }
+                        }
+                        else
+                        {
+                            p.pss = pss;
+                            p.swapPss = swapPss;
+                        }
+
+                        mExitedProcesses.emplace_back(std::move(*process));
+                        mRunningProcesses.erase(process);
+                    }
+                    break;
+                }
+                default:
+                    break;
             }
         }
     }
@@ -558,6 +580,25 @@ std::string ProcessMonitor::GetJson()
     results["start"] = std::chrono::duration_cast<std::chrono::milliseconds>(mStart.time_since_epoch()).count();
     results["end"] = std::chrono::duration_cast<std::chrono::milliseconds>(mEnd.time_since_epoch()).count();
 
+    auto coveragePercentage = [](std::size_t missing, std::size_t total) -> double {
+        if (total == 0) { return 0.0; }
+        return static_cast<double>(missing) * 100.0 / static_cast<double>(total);
+    };
+
+    results["stats"]["coverage"]["smaps"]["attempts"] = mSMapsSampleCount;
+    results["stats"]["coverage"]["smaps"]["missing"] = mSMapsMissingCount;
+    results["stats"]["coverage"]["smaps"]["missingPercentage"] =
+    coveragePercentage(mSMapsMissingCount, mSMapsSampleCount);
+
+    results["stats"]["coverage"]["stat"]["attempts"] = mStatSampleCount;
+    results["stats"]["coverage"]["stat"]["missing"] = mStatMissingCount;
+    results["stats"]["coverage"]["stat"]["missingPercentage"] =
+    coveragePercentage(mStatMissingCount, mStatSampleCount);
+
+    results["stats"]["totals"]["processesCaptured"] = results["processes"].size();
+    results["stats"]["totals"]["exitsSeen"] = mExitedProcesses.size();
+    results["stats"]["totals"]["statMissing"] = mStatMissingCount;
+    results["stats"]["totals"]["smapsMissing"] = mSMapsMissingCount;
     return results.dump();
 }
 

@@ -42,6 +42,12 @@ private:
     int getPSSandSwapPSS(pid_t pid, unsigned long *pssTotal, unsigned long *swappssTotal);
     bool getCPUAndRSS(pid_t pid, unsigned long *cpuTime, unsigned long *rss, std::string &processName);
 
+    // Statistics to quantify how often we're missing smaps and stat files
+    std::size_t mSMapsSampleCount{0};
+    std::size_t mSMapsMissingCount{0};
+    std::size_t mStatSampleCount{0};
+    std::size_t mStatMissingCount{0};
+
 private:
     int mSocket;
     bool mListen;

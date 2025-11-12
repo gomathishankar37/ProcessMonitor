@@ -29,6 +29,7 @@
                     <select onchange="filterGroups()" class="form-select" id="process-select"></select>
                 </div>
             </div>
+            <div class="alert alert-warning py-2" id="data-health-banner" style="display:none;"></div>
             <div id="visualization"></div>
             <p class="mt-1 fst-italic">Hold Ctrl and scroll to zoom in/out</p>
         </div>
@@ -120,6 +121,37 @@
 </div>
 
 <script type="text/javascript">
+    function showCoverageStats() {
+        const banner = document.getElementById('data-health-banner');
+        if (!results.stats || !results.stats.coverage) {
+            return;
+        }
+
+        const coverage = results.stats.coverage;
+        const smaps = coverage.smaps || {};
+        const stat = coverage.stat || {};
+
+        const rows = [];
+
+        if (smaps.attempts > 0) {
+            const percent = typeof smaps.missingPercentage === 'number'
+                ? smaps.missingPercentage.toFixed(1)
+                : '-';
+            rows.push(`PSS/SwapPSS missing: ${percent}% (${smaps.missing}/${smaps.attempts})`);
+        }
+
+        if (stat.attempts > 0) {
+            const percent = typeof stat.missingPercentage === 'number'
+                ? stat.missingPercentage.toFixed(1)
+                : '-';
+            rows.push(`CPU/RSS missing: ${percent}% (${stat.missing}/${stat.attempts})`);
+        }
+
+        if (rows.length > 0) {
+            banner.style.display = 'block';
+            banner.innerHTML = `<strong>Data coverage</strong><br>${rows.join('<br>')}`;
+        }
+    }
     function setClusterOptions(enable, zoom = false) {
         if (enable) {
             if (!zoom) {
@@ -299,7 +331,7 @@
         // Show stats (top 5 processes)
         showTopProcess();
         showTopServices();
-
+        showCoverageStats();
 
         document.getElementById('start-time').innerText = new Date(results.start).toLocaleString();
         document.getElementById('end-time').innerText = new Date(results.end).toLocaleString();
