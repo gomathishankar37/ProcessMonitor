@@ -39,6 +39,10 @@ private:
 
     std::string getSystemdService(pid_t pid);
 
+    bool runShellCommand(const std::string &command) const;
+    bool setupMemPreload();
+    void teardownMemPreload();
+
 private:
     int mSocket;
     bool mListen;
@@ -55,4 +59,6 @@ private:
 
     std::chrono::time_point<std::chrono::system_clock> mStart;
     std::chrono::time_point<std::chrono::system_clock> mEnd;
+
+    bool mMemPreloadActive = false;
 };

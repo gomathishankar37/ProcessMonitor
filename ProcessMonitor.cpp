@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #define OP_LDH (BPF_LD | BPF_H | BPF_ABS)
 #define OP_LDB (BPF_LD | BPF_B | BPF_ABS)
@@ -26,6 +27,9 @@
 #define OP_RET (BPF_RET | BPF_K)
 #define BPF_ALLOW 0xffffffff
 #define BPF_DENY 0
+
+extern bool gCaptureMemData;
+extern std::string gMemPreloadLib;
 
 /**
  * References:
@@ -84,6 +88,15 @@ ProcessMonitor::~ProcessMonitor()
  */
 bool ProcessMonitor::Start()
 {
+    bool overlayJustActivated = false;
+    if (gCaptureMemData && !mMemPreloadActive) {
+        if (!setupMemPreload()) {
+            Log("Failed to set up memory preload");
+            return false;
+        }
+        overlayJustActivated = true;
+    }
+    
     if (mValid)
     {
         mStart = std::chrono::system_clock::now();
@@ -93,9 +106,23 @@ bool ProcessMonitor::Start()
         {
             mMessageReceiver = std::thread(&ProcessMonitor::receiveMessages, this);
 
-            return mMessageReceiver.joinable();
+            if (mMessageReceiver.joinable())
+            {
+                return true;
+            }
+
+            Log("Message receiver thread failed to start");
+            mListen = false;
         }
-        return false;
+        else
+        {
+            Log("Failed to enable listen mode");
+        }
+    }
+
+    if (overlayJustActivated)
+    {
+        teardownMemPreload();
     }
 
     return false;
@@ -116,6 +143,7 @@ bool ProcessMonitor::Stop()
     }
 
     setListenMode(false);
+    teardownMemPreload();
 
     return true;
 }
@@ -539,4 +567,102 @@ std::string ProcessMonitor::getSystemdService(pid_t pid)
     }
 
     return "None";
+}
+
+bool ProcessMonitor::setupMemPreload()
+{
+    if (!gCaptureMemData) {
+        return true;
+    }
+    if (gMemPreloadLib.empty()) {
+        Log("Memory preload requested but no library path provided");
+        return false;
+    }
+
+    Log("Preparing bind-mounted /etc for memory preload");
+
+    if (!runShellCommand("/bin/rm -rf /media/apps/etc"))
+    {
+        Log("Failed to clear /media/apps/etc");
+        return false;
+    }
+
+    if (!runShellCommand("/bin/mkdir -p /media/apps/etc"))
+    {
+        Log("Failed to create /media/apps/etc");
+        return false;
+    }
+
+    if (!runShellCommand("/bin/cp -a /etc /media/apps/etc")) {
+        Log("Failed to copy /etc into /media/apps/etc");
+        return false;
+    }
+
+    if (!runShellCommand("/sbin/mount-copybind /media/apps/etc /etc")) {
+        Log("Failed to bind-mount /media/apps/etc onto /etc");
+        runShellCommand("/bin/rm -rf /media/apps/etc");
+        return false;
+    }
+
+    std::string cmd = "/bin/sh -c '/bin/echo " + gMemPreloadLib + " > /etc/ld.so.preload'";
+    if (!runShellCommand(cmd)) {
+        Log("Failed to write preload library to /etc/ld.so.preload");
+        runShellCommand("/bin/umount /etc");
+        runShellCommand("/bin/rm -rf /media/apps/etc");
+        return false;
+    }
+
+    mMemPreloadActive = true;
+    Log("Memory preload enabled via %s", gMemPreloadLib.c_str());
+    return true;
+}
+
+void ProcessMonitor::teardownMemPreload()
+{
+    if (!mMemPreloadActive)
+    {
+        return;
+    }
+
+    Log("Tearing down bind-mounted /etc for memory preload");
+
+    if (!runShellCommand("/bin/umount /etc"))
+    {
+        Log("Failed to unmount /etc; manual cleanup required");
+        return;
+    }
+
+    if (!runShellCommand("/bin/rm -rf /media/apps/etc"))
+    {
+        Log("Failed to remove /media/apps/etc; manual cleanup required");
+    }
+
+    if (!runShellCommand("/bin/sh -c '> /etc/ld.so.preload'"))
+    {
+        Log("Warning: failed to clear /etc/ld.so.preload");
+    }
+
+    mMemPreloadActive = false;
+}
+
+bool ProcessMonitor::runShellCommand(const std::string &command) const
+{
+    Log("Running command: %s", command.c_str());
+
+    int rc = std::system(command.c_str());
+    if (rc == 0)
+    {
+        Log("Command succeeded: %s", command.c_str());
+        return true;
+    }
+
+    if (rc == -1)
+    {
+        Log("Command failed to start: %s (errno=%d, %s)", command.c_str(), errno, strerror(errno));
+    }
+    else
+    {
+        Log("Command returned non-zero: %s (status=%d)", command.c_str(), rc);
+    }
+    return false;
 }
