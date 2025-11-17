@@ -809,11 +809,11 @@ void ProcessMonitor::mergeExitHandlerData()
         {
             continue;
         }
-        const auto& entries = it->second;
+        auto& entries = it->second;
 
         // Find entry with nearest timestamp to process.endTime
         ExitHandlerEntry* bestMatch = nullptr;
-        auto minTimeDiff = std::chrono::hours(24); // Start with large value
+        auto minTimeDiff = std::chrono::seconds::max(); // Start with large value
 
         for (auto& entry : entries)
         {
@@ -860,8 +860,7 @@ void ProcessMonitor::mergeExitHandlerData()
 
             if (!nameMatches)
             {
-                Log("PID %d: large timestamp diff %lds, name mismatch ('%s' vs '%s'), skipping",
-                    process.pid, minTimeDiff.count(), processBasename.c_str(), entryBasename.c_str());
+                Log("PID %d: large timestamp diff %llds, name mismatch ('%s' vs '%s'), skipping", process.pid, minTimeDiff.count(), processBasename.c_str(), entryBasename.c_str());
                 continue;
             }
         }
