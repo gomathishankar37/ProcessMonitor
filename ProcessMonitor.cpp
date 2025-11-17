@@ -19,6 +19,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cstdlib>
+#include <ctime>
+#include <map>
 
 #define OP_LDH (BPF_LD | BPF_H | BPF_ABS)
 #define OP_LDB (BPF_LD | BPF_B | BPF_ABS)
@@ -27,6 +29,8 @@
 #define OP_RET (BPF_RET | BPF_K)
 #define BPF_ALLOW 0xffffffff
 #define BPF_DENY 0
+
+#define _XOPEN_SOURCE 700
 
 extern bool gCaptureMemData;
 extern std::string gMemPreloadLib;
@@ -456,6 +460,9 @@ pid_t ProcessMonitor::getParentPid(pid_t pid)
  */
 std::string ProcessMonitor::GetJson()
 {
+    if (gCaptureMemData) {
+        mergeExitHandlerData();
+    }
     Log("Generating process JSON");
 
     // Convert this into a form that vis.js timeline can understand
@@ -491,6 +498,28 @@ std::string ProcessMonitor::GetJson()
             process["grandparentCommandLine"] = p.grandparentCommandLine;
             process["exitCode"] = p.exitCode;
             process["systemdService"] = p.systemdServiceName;
+
+            // Add memory statistics if available
+            if (p.pss.has_value())
+            {
+                process["pss"] = *p.pss;
+            }
+            if (p.swapPss.has_value())
+            {
+                process["swapPss"] = *p.swapPss;
+            }
+            if (p.rss.has_value())
+            {
+                process["rss"] = *p.rss;
+            }
+            if (p.utime.has_value())
+            {
+                process["utime"] = *p.utime;
+            }
+            if (p.stime.has_value())
+            {
+                process["stime"] = *p.stime;
+            }
 
             results["processes"].emplace_back(process);
 
@@ -665,4 +694,187 @@ bool ProcessMonitor::runShellCommand(const std::string &command) const
         Log("Command returned non-zero: %s (status=%d)", command.c_str(), rc);
     }
     return false;
+}
+
+void ProcessMonitor::mergeExitHandlerData()
+{
+    if (mExitHandlerDataMerged)
+    {
+        return;
+    }
+
+    std::ifstream file("/tmp/exitHandler.txt");
+    if (!file.is_open())
+    {
+        Log("Could not open /tmp/exitHandler.txt for reading (may not exist yet)");
+        mExitHandlerDataMerged = true;
+        return;
+    }
+
+    Log("Parsing exit handler data from /tmp/exitHandler.txt");
+
+    // Map to store exit handler entries by PID
+    // Key: PID, Value: struct with timestamp and memory stats
+    struct ExitHandlerEntry
+    {
+        std::chrono::time_point<std::chrono::system_clock> timestamp;
+        std::string processName;
+        unsigned long utime, stime, rss, pss, swapPss;
+    };
+
+    // Map: PID -> vector of entries (handle PID reuse)
+    std::map<pid_t, std::vector<ExitHandlerEntry>> exitHandlerMap;
+
+    std::string line;
+    int parsedCount = 0;
+    int errorCount = 0;
+
+    while (std::getline(file, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+
+        // Parse format: "timestamp: pid processName utime stime rss, pss, swappss"
+        // Example: "2024_01_15 10_30_45: 1234 /bin/ls 100 50 4096, 2048, 512"
+        
+        // Skip error format lines: "pid errno"
+        if (line.find(':') == std::string::npos)
+        {
+            // Try error format: "pid errno"
+            pid_t pid;
+            int err;
+            if (sscanf(line.c_str(), "%d %d", &pid, &err) == 2)
+            {
+                Log("Exit handler error entry: pid %d, errno %d", pid, err);
+                errorCount++;
+            }
+            continue;
+        }
+
+        // Parse format: "timestamp: pid processName utime stime rss, pss, swappss"
+        size_t colonPos = line.find(':');
+        std::string timestampStr = line.substr(0, colonPos);
+        std::string dataStr = line.substr(colonPos + 1);
+
+        // Parse timestamp (format: "YYYY_MM_DD HH_MM_SS")
+        struct tm tm = {};
+        if (strptime(timestampStr.c_str(), "%Y_%m_%d %H_%M_%S", &tm) == nullptr)
+        {
+            Log("Failed to parse timestamp: %s", timestampStr.c_str());
+            continue;
+        }
+
+        auto timestamp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+
+        // Parse data: " pid processName utime stime rss, pss, swappss"
+        pid_t pid;
+        char processName[256];
+        unsigned long utime, stime, rss, pss, swapPss;
+
+        if (sscanf(dataStr.c_str(), " %d %255s %lu %lu %lu, %lu, %lu", &pid, processName, &utime, &stime, &rss, &pss, &swapPss) == 7)
+        {
+            ExitHandlerEntry entry;
+            entry.timestamp = timestamp;
+            entry.processName = processName;
+            entry.utime = utime;
+            entry.stime = stime;
+            entry.rss = rss;
+            entry.pss = pss;
+            entry.swapPss = swapPss;
+
+            exitHandlerMap[pid].push_back(entry);
+            parsedCount++;
+        }
+        else
+        {
+            Log("Failed to parse exit handler data line: %s", line.c_str());
+        }
+    }
+    file.close();
+    if (file.bad())
+    {
+        Log("Error occurred while reading /tmp/exitHandler.txt");
+    }
+    Log("Parsed %d exit handler entries (%d errors)", parsedCount, errorCount);
+
+    // Merge into mExitedProcesses
+    int matchedCount = 0;
+
+    for (auto& process : mExitedProcesses)
+    {
+        auto it = exitHandlerMap.find(process.pid);
+        if (it == exitHandlerMap.end() || it->second.empty())
+        {
+            continue;
+        }
+        const auto& entries = it->second;
+
+        // Find entry with nearest timestamp to process.endTime
+        ExitHandlerEntry* bestMatch = nullptr;
+        auto minTimeDiff = std::chrono::hours(24); // Start with large value
+
+        for (auto& entry : entries)
+        {
+            auto timeDiff = std::chrono::duration_cast<std::chrono::seconds>(
+                process.endTime > entry.timestamp ?
+                process.endTime - entry.timestamp :
+                entry.timestamp - process.endTime);
+
+            if (timeDiff < minTimeDiff)
+            {
+                minTimeDiff = timeDiff;
+                bestMatch = &entry;
+            }
+        }
+
+        if (bestMatch == nullptr)
+        {
+            continue;
+        }
+
+        // Optional name validation for large timestamp differences (fallback check)
+        if (minTimeDiff > std::chrono::seconds(10))
+        {
+            std::string processBasename = process.GetStrippedName();
+            std::string entryBasename = bestMatch->processName;
+
+            // Extract basename from entry
+            size_t slashPos = entryBasename.find_last_of('/');
+            if (slashPos != std::string::npos)
+            {
+                entryBasename = entryBasename.substr(slashPos + 1);
+            }
+
+            // Extract basename from process name
+            slashPos = processBasename.find_last_of('/');
+            if (slashPos != std::string::npos)
+            {
+                processBasename = processBasename.substr(slashPos + 1);
+            }
+
+            // Fuzzy name match
+            bool nameMatches = (processBasename.find(entryBasename) != std::string::npos) ||
+                               (entryBasename.find(processBasename) != std::string::npos);
+
+            if (!nameMatches)
+            {
+                Log("PID %d: large timestamp diff %lds, name mismatch ('%s' vs '%s'), skipping",
+                    process.pid, minTimeDiff.count(), processBasename.c_str(), entryBasename.c_str());
+                continue;
+            }
+        }
+
+        // Copy memory stats
+        process.pss = bestMatch->pss;
+        process.swapPss = bestMatch->swapPss;
+        process.rss = bestMatch->rss;
+        process.utime = bestMatch->utime;
+        process.stime = bestMatch->stime;
+        matchedCount++;
+    }
+
+    Log("Merged memory stats for %d processes", matchedCount);
+    mExitHandlerDataMerged = true;
 }

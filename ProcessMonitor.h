@@ -39,6 +39,8 @@ private:
 
     std::string getSystemdService(pid_t pid);
 
+    void mergeExitHandlerData();
+
     bool runShellCommand(const std::string &command) const;
     bool setupMemPreload();
     void teardownMemPreload();
@@ -61,4 +63,5 @@ private:
     std::chrono::time_point<std::chrono::system_clock> mEnd;
 
     bool mMemPreloadActive = false;
+    bool mExitHandlerDataMerged = false;
 };

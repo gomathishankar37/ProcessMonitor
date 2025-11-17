@@ -11,7 +11,7 @@
     <script src="https://code.jquery.com/jquery-3.6.3.slim.min.js"
             integrity="sha256-ZwqZIVdD3iXNyGHbSYdsmWP//UBokj2FHAxKuSBKDSo=" crossorigin="anonymous"></script>
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet"/>
-    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.js"></script>
 
     <script src="results.js"></script>
 
@@ -31,6 +31,31 @@
             </div>
             <div id="visualization"></div>
             <p class="mt-1 fst-italic">Hold Ctrl and scroll to zoom in/out</p>
+            
+            <!-- Memory Stats Checkboxes -->
+            <div id="memory-stats-controls" class="mt-3" style="display: none;">
+                <h5>Memory & CPU Statistics</h5>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="show-pss" onchange="toggleMemoryStats()">
+                    <label class="form-check-label" for="show-pss">Show PSS</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="show-swappss" onchange="toggleMemoryStats()">
+                    <label class="form-check-label" for="show-swappss">Show SwapPSS</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="show-rss" onchange="toggleMemoryStats()">
+                    <label class="form-check-label" for="show-rss">Show RSS</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="show-utime" onchange="toggleMemoryStats()">
+                    <label class="form-check-label" for="show-utime">Show User CPU Time</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="show-stime" onchange="toggleMemoryStats()">
+                    <label class="form-check-label" for="show-stime">Show System CPU Time</label>
+                </div>
+            </div>
         </div>
         <div id="stats" class="col-3">
             <h4>Top 10 Systemd Services</h4>
@@ -92,6 +117,27 @@
                     <td>Systemd Service</td>
                     <td id="selected-process-systemd-service">-</td>
                 </tr>
+                <!-- Memory Stats Rows -->
+                <tr id="selected-process-pss-row" style="display: none;">
+                    <td>PSS (KB)</td>
+                    <td id="selected-process-pss">-</td>
+                </tr>
+                <tr id="selected-process-swappss-row" style="display: none;">
+                    <td>SwapPSS (KB)</td>
+                    <td id="selected-process-swappss">-</td>
+                </tr>
+                <tr id="selected-process-rss-row" style="display: none;">
+                    <td>RSS (KB)</td>
+                    <td id="selected-process-rss">-</td>
+                </tr>
+                <tr id="selected-process-utime-row" style="display: none;">
+                    <td>User CPU Time (ms)</td>
+                    <td id="selected-process-utime">-</td>
+                </tr>
+                <tr id="selected-process-stime-row" style="display: none;">
+                    <td>System CPU Time (ms)</td>
+                    <td id="selected-process-stime">-</td>
+                </tr>
                 </tbody>
             </table>
         </div>
@@ -100,6 +146,19 @@
 </div>
 
 <script type="text/javascript">
+    // Clock ticks per second (typically 100 Hz, so 1 jiffy = 10 ms)
+    const CLOCK_TICKS_PER_SEC = 100;
+    
+    // Check if memory data exists
+    function hasMemoryData() {
+        return results.processes.some(p => 'pss' in p || 'rss' in p || 'utime' in p || 'stime' in p);
+    }
+    
+    // Convert jiffies to milliseconds
+    function jiffiesToMs(jiffies) {
+        return Math.round((jiffies * 1000) / CLOCK_TICKS_PER_SEC);
+    }
+
     function setClusterOptions(enable, zoom = false) {
         if (enable) {
             if (!zoom) {
@@ -110,7 +169,6 @@
                     }
                 });
             } else {
-                // Whilst zoomed in, show more items before clustering since we have more screen space
                 window.timeline.setOptions({
                     cluster: {
                         titleTemplate: "{count} more events - double click to focus",
@@ -129,7 +187,6 @@
     function filterGroups() {
         let selected = document.getElementById('process-select').value;
 
-        // Work around a weird bug - have to disable clustering before hiding/showing groups
         setClusterOptions(false);
 
         if (selected === '__all_processes__') {
@@ -137,14 +194,12 @@
             window.groups.forEach(function (group) {
                 window.groups.update({id: group.id, visible: true});
             });
-            // Renable clustering
             setClusterOptions(true);
         } else {
             window.timeline.fit();
             window.groups.forEach(function (group) {
                 window.groups.update({id: group.id, visible: group.id === selected});
             });
-            // Renable clustering
             setClusterOptions(true, true);
         }
     }
@@ -187,20 +242,145 @@
         }
     }
 
+    function createMemoryStatsItems() {
+        let memoryItems = [];
+        const showPss = document.getElementById('show-pss').checked;
+        const showSwapPss = document.getElementById('show-swappss').checked;
+        const showRss = document.getElementById('show-rss').checked;
+        const showUtime = document.getElementById('show-utime').checked;
+        const showStime = document.getElementById('show-stime').checked;
+
+        if (!showPss && !showSwapPss && !showRss && !showUtime && !showStime) {
+            return memoryItems;
+        }
+
+        results.processes.forEach(proc => {
+            const endTime = proc.end;
+            const pid = proc.pid;
+            const procName = proc.content;
+
+            if (showPss && 'pss' in proc) {
+                memoryItems.push({
+                    id: `pss_${proc.id}`,
+                    content: `PSS: ${proc.pss} KB`,
+                    start: endTime,
+                    end: endTime,
+                    group: 'Memory Stats',
+                    title: `${procName} (PID: ${pid}) - PSS: ${proc.pss} KB`,
+                    className: 'memory-pss'
+                });
+            }
+
+            if (showSwapPss && 'swapPss' in proc) {
+                memoryItems.push({
+                    id: `swappss_${proc.id}`,
+                    content: `SwapPSS: ${proc.swapPss} KB`,
+                    start: endTime,
+                    end: endTime,
+                    group: 'Memory Stats',
+                    title: `${procName} (PID: ${pid}) - SwapPSS: ${proc.swapPss} KB`,
+                    className: 'memory-swappss'
+                });
+            }
+
+            if (showRss && 'rss' in proc) {
+                memoryItems.push({
+                    id: `rss_${proc.id}`,
+                    content: `RSS: ${proc.rss} KB`,
+                    start: endTime,
+                    end: endTime,
+                    group: 'Memory Stats',
+                    title: `${procName} (PID: ${pid}) - RSS: ${proc.rss} KB`,
+                    className: 'memory-rss'
+                });
+            }
+
+            if (showUtime && 'utime' in proc) {
+                const utimeMs = jiffiesToMs(proc.utime);
+                memoryItems.push({
+                    id: `utime_${proc.id}`,
+                    content: `User CPU: ${utimeMs} ms`,
+                    start: endTime,
+                    end: endTime,
+                    group: 'Memory Stats',
+                    title: `${procName} (PID: ${pid}) - User CPU: ${utimeMs} ms`,
+                    className: 'memory-utime'
+                });
+            }
+
+            if (showStime && 'stime' in proc) {
+                const stimeMs = jiffiesToMs(proc.stime);
+                memoryItems.push({
+                    id: `stime_${proc.id}`,
+                    content: `System CPU: ${stimeMs} ms`,
+                    start: endTime,
+                    end: endTime,
+                    group: 'Memory Stats',
+                    title: `${procName} (PID: ${pid}) - System CPU: ${stimeMs} ms`,
+                    className: 'memory-stime'
+                });
+            }
+        });
+
+        return memoryItems;
+    }
+
+    function toggleMemoryStats() {
+        if (!window.timeline || !window.items) {
+            return;
+        }
+
+        // Remove existing memory items
+        const existingMemoryIds = window.items.getIds().filter(id => 
+            id.startsWith('pss_') || id.startsWith('swappss_') || 
+            id.startsWith('rss_') || id.startsWith('utime_') || id.startsWith('stime_')
+        );
+        if (existingMemoryIds.length > 0) {
+            window.items.remove(existingMemoryIds);
+        }
+
+        // Add new memory items based on checkboxes
+        const memoryItems = createMemoryStatsItems();
+        if (memoryItems.length > 0) {
+            window.items.add(memoryItems);
+        }
+
+        // Ensure Memory Stats group exists and is visible
+        if (memoryItems.length > 0) {
+            if (!window.groups.get('Memory Stats')) {
+                window.groups.add({
+                    id: 'Memory Stats',
+                    content: 'Memory Stats',
+                    className: 'memory-stats-group'
+                });
+            }
+            window.groups.update({id: 'Memory Stats', visible: true});
+        }
+    }
+
     function renderTimeline() {
         if (window.timeline != null) {
             window.timeline.destroy();
             window.timeline = null;
         }
 
-        // DOM element where the Timeline will be attached
         let container = document.getElementById('visualization');
 
-        // Create a DataSet (allows two way data-binding)
         let items = new vis.DataSet(results.processes);
+        window.items = items;
         window.groups = new vis.DataSet(results.groups);
 
-        // Configuration for the Timeline
+        // Add Memory Stats group if memory data exists
+        if (hasMemoryData()) {
+            window.groups.add({
+                id: 'Memory Stats',
+                content: 'Memory Stats',
+                visible: false,
+                className: 'memory-stats-group'
+            });
+            document.getElementById('memory-stats-controls').style.display = 'block';
+        }
+
         let options = {
             stack: true,
             verticalScroll: true,
@@ -211,10 +391,8 @@
             max: results.end
         };
 
-        // Show dropdown for selection
         let dropdown = document.getElementById('process-select');
 
-        // Add 'all' option
         let allOption = document.createElement('option');
         allOption.text = "Show all";
         allOption.value = "__all_processes__";
@@ -230,14 +408,21 @@
 
         $('#process-select').select2();
 
-        // Create a Timeline
         window.timeline = new vis.Timeline(container, items, options);
         timeline.setGroups(groups);
         setClusterOptions(true);
 
-        // Show selected processes
         timeline.on('select', function (properties) {
             let id = properties.items[0];
+            if (!id) return;
+
+            // Check if it's a memory stat item
+            if (id.startsWith('pss_') || id.startsWith('swappss_') || 
+                id.startsWith('rss_') || id.startsWith('utime_') || id.startsWith('stime_')) {
+                // Extract process ID from memory item ID
+                const procId = id.substring(id.indexOf('_') + 1);
+                id = procId;
+            }
 
             let process = results.processes.find(obj => {
                 return obj.id === id;
@@ -252,7 +437,46 @@
                 document.getElementById('selected-process-grandparent-comm').innerText = process.grandparentCommandLine;
                 document.getElementById('selected-process-exitcode').innerText = process.exitCode;
                 document.getElementById('selected-process-systemd-service').innerText = process.systemdService;
+
+                // Show memory stats if available
+                if ('pss' in process) {
+                    document.getElementById('selected-process-pss').innerText = process.pss + ' KB';
+                    document.getElementById('selected-process-pss-row').style.display = '';
+                } else {
+                    document.getElementById('selected-process-pss-row').style.display = 'none';
+                }
+
+                if ('swapPss' in process) {
+                    document.getElementById('selected-process-swappss').innerText = process.swapPss + ' KB';
+                    document.getElementById('selected-process-swappss-row').style.display = '';
+                } else {
+                    document.getElementById('selected-process-swappss-row').style.display = 'none';
+                }
+
+                if ('rss' in process) {
+                    document.getElementById('selected-process-rss').innerText = process.rss + ' KB';
+                    document.getElementById('selected-process-rss-row').style.display = '';
+                } else {
+                    document.getElementById('selected-process-rss-row').style.display = 'none';
+                }
+
+                if ('utime' in process) {
+                    const utimeMs = jiffiesToMs(process.utime);
+                    document.getElementById('selected-process-utime').innerText = utimeMs + ' ms';
+                    document.getElementById('selected-process-utime-row').style.display = '';
+                } else {
+                    document.getElementById('selected-process-utime-row').style.display = 'none';
+                }
+
+                if ('stime' in process) {
+                    const stimeMs = jiffiesToMs(process.stime);
+                    document.getElementById('selected-process-stime').innerText = stimeMs + ' ms';
+                    document.getElementById('selected-process-stime-row').style.display = '';
+                } else {
+                    document.getElementById('selected-process-stime-row').style.display = 'none';
+                }
             } else {
+                // Clear all fields
                 document.getElementById('selected-process-pid').innerText = "-";
                 document.getElementById('selected-process-name').innerText = "-";
                 document.getElementById('selected-process-comm').innerText = "-";
@@ -261,23 +485,48 @@
                 document.getElementById('selected-process-grandparent-comm').innerText = "-";
                 document.getElementById('selected-process-exitcode').innerText = "-";
                 document.getElementById('selected-process-systemd-service').innerText = "-";
+                document.getElementById('selected-process-pss-row').style.display = 'none';
+                document.getElementById('selected-process-swappss-row').style.display = 'none';
+                document.getElementById('selected-process-rss-row').style.display = 'none';
+                document.getElementById('selected-process-utime-row').style.display = 'none';
+                document.getElementById('selected-process-stime-row').style.display = 'none';
             }
         });
 
-        // Show stats (top 5 processes)
         showTopProcess();
         showTopServices();
 
-
         document.getElementById('start-time').innerText = new Date(results.start).toLocaleString();
         document.getElementById('end-time').innerText = new Date(results.end).toLocaleString();
-
-        // Show top systemd services
-
-
     }
 
     renderTimeline();
 </script>
+
+<style>
+    .memory-stats-group {
+        background-color: #e3f2fd !important;
+    }
+    .memory-pss {
+        background-color: #4caf50 !important;
+        color: white !important;
+    }
+    .memory-swappss {
+        background-color: #ff9800 !important;
+        color: white !important;
+    }
+    .memory-rss {
+        background-color: #2196f3 !important;
+        color: white !important;
+    }
+    .memory-utime {
+        background-color: #9c27b0 !important;
+        color: white !important;
+    }
+    .memory-stime {
+        background-color: #f44336 !important;
+        color: white !important;
+    }
+</style>
 </body>
 </html>
