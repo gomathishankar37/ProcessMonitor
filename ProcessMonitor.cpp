@@ -860,7 +860,7 @@ void ProcessMonitor::mergeExitHandlerData()
 
             if (!nameMatches)
             {
-                Log("PID %d: large timestamp diff %llds, name mismatch ('%s' vs '%s'), skipping", process.pid, minTimeDiff.count(), processBasename.c_str(), entryBasename.c_str());
+                Log("PID %d: large timestamp diff %lds, name mismatch ('%s' vs '%s'), skipping", process.pid, minTimeDiff.count(), processBasename.c_str(), entryBasename.c_str());
                 continue;
             }
         }
