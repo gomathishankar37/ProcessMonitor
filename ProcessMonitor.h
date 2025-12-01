@@ -41,7 +41,6 @@ private:
 
     void mergeExitHandlerData();
 
-    bool runShellCommand(const std::string &command) const;
     bool setupMemPreload();
     void teardownMemPreload();
 

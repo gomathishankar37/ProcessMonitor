@@ -21,6 +21,10 @@
 #include <cstdlib>
 #include <ctime>
 #include <map>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <dirent.h>
+#include <cstring>
 
 #define OP_LDH (BPF_LD | BPF_H | BPF_ABS)
 #define OP_LDB (BPF_LD | BPF_B | BPF_ABS)
@@ -32,8 +36,357 @@
 
 #define _XOPEN_SOURCE 700
 
+#define MOUNT_DIR "/media/apps"
+#define ETC_DIR "/etc"
+
 extern bool gCaptureMemData;
 extern std::string gMemPreloadLib;
+
+/**
+ * @brief Recursively remove all files and subdirectories in a directory
+ * 
+ * @param path Path to the directory to clear
+ * @return true if successful, false otherwise
+ */
+static bool clearDirectory(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (dir == nullptr)
+    {
+        if (errno == ENOENT)
+        {
+            // Directory doesn't exist, nothing to clear
+            Log("Directory %s does not exist, nothing to clear", path);
+            return true;
+        }
+        Log("Failed to open directory %s: %s", path, strerror(errno));
+        return false;
+    }
+
+    struct dirent *entry;
+    bool success = true;
+
+    while ((entry = readdir(dir)) != nullptr)
+    {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        {
+            continue;
+        }
+
+        char fullPath[PATH_MAX];
+        int ret = snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entry->d_name);
+        if (ret < 0 || ret >= (int)sizeof(fullPath))
+        {
+            Log("Path too long: %s/%s", path, entry->d_name);
+            success = false;
+            continue;
+        }
+
+        struct stat statbuf;
+        if (lstat(fullPath, &statbuf) != 0)
+        {
+            Log("Failed to stat %s: %s", fullPath, strerror(errno));
+            success = false;
+            continue;
+        }
+
+        if (S_ISDIR(statbuf.st_mode))
+        {
+            // Recursively clear and remove subdirectory
+            if (!clearDirectory(fullPath))
+            {
+                success = false;
+                continue;
+            }
+            if (rmdir(fullPath) != 0)
+            {
+                Log("Failed to remove directory %s: %s", fullPath, strerror(errno));
+                success = false;
+            }
+        }
+        else
+        {
+            // Remove file
+            if (unlink(fullPath) != 0)
+            {
+                Log("Failed to remove file %s: %s", fullPath, strerror(errno));
+                success = false;
+            }
+        }
+    }
+
+    closedir(dir);
+    return success;
+}
+
+/**
+ * @brief Create a directory with all parent directories
+ * 
+ * @param path Path to the directory to create
+ * @return true if successful, false otherwise
+ */
+static bool createDirectory(const char *path)
+{
+    char tmp[PATH_MAX];
+    char *p = nullptr;
+    size_t len;
+
+    int ret = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (ret < 0 || ret >= (int)sizeof(tmp))
+    {
+        Log("Path too long: %s", path);
+        return false;
+    }
+
+    len = strlen(tmp);
+    if (tmp[len - 1] == '/')
+    {
+        tmp[len - 1] = 0;
+    }
+
+    for (p = tmp + 1; *p; p++)
+    {
+        if (*p == '/')
+        {
+            *p = 0;
+            if (mkdir(tmp, 0755) != 0)
+            {
+                if (errno != EEXIST)
+                {
+                    Log("Failed to create directory %s: %s", tmp, strerror(errno));
+                    return false;
+                }
+            }
+            *p = '/';
+        }
+    }
+
+    if (mkdir(tmp, 0755) != 0)
+    {
+        if (errno != EEXIST)
+        {
+            Log("Failed to create directory %s: %s", tmp, strerror(errno));
+            return false;
+        }
+    }
+
+    Log("Created directory: %s", path);
+    return true;
+}
+
+/**
+ * @brief Recursively copy a directory and its contents
+ * 
+ * @param src Source directory path
+ * @param dest Destination directory path
+ * @return true if successful, false otherwise
+ */
+static bool copyDirectory(const char *src, const char *dest)
+{
+    DIR *dir = opendir(src);
+    if (dir == nullptr)
+    {
+        Log("Failed to open source directory %s: %s", src, strerror(errno));
+        return false;
+    }
+
+    // Create destination directory
+    if (!createDirectory(dest))
+    {
+        closedir(dir);
+        return false;
+    }
+
+    struct dirent *entry;
+    bool success = true;
+
+    while ((entry = readdir(dir)) != nullptr)
+    {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        {
+            continue;
+        }
+
+        char srcPath[PATH_MAX];
+        char destPath[PATH_MAX];
+
+        int ret = snprintf(srcPath, sizeof(srcPath), "%s/%s", src, entry->d_name);
+        if (ret < 0 || ret >= (int)sizeof(srcPath))
+        {
+            Log("Source path too long: %s/%s", src, entry->d_name);
+            success = false;
+            continue;
+        }
+
+        ret = snprintf(destPath, sizeof(destPath), "%s/%s", dest, entry->d_name);
+        if (ret < 0 || ret >= (int)sizeof(destPath))
+        {
+            Log("Destination path too long: %s/%s", dest, entry->d_name);
+            success = false;
+            continue;
+        }
+
+        struct stat statbuf;
+        if (lstat(srcPath, &statbuf) != 0)
+        {
+            Log("Failed to stat %s: %s", srcPath, strerror(errno));
+            success = false;
+            continue;
+        }
+
+        if (S_ISDIR(statbuf.st_mode))
+        {
+            // Recursively copy subdirectory
+            if (!copyDirectory(srcPath, destPath))
+            {
+                success = false;
+            }
+        }
+        else if (S_ISLNK(statbuf.st_mode))
+        {
+            // Copy symlink
+            char linkTarget[PATH_MAX];
+            ssize_t linkLen = readlink(srcPath, linkTarget, sizeof(linkTarget) - 1);
+            if (linkLen < 0)
+            {
+                Log("Failed to read symlink %s: %s", srcPath, strerror(errno));
+                success = false;
+                continue;
+            }
+            linkTarget[linkLen] = '\0';
+
+            if (symlink(linkTarget, destPath) != 0)
+            {
+                Log("Failed to create symlink %s -> %s: %s", destPath, linkTarget, strerror(errno));
+                success = false;
+            }
+        }
+        else if (S_ISREG(statbuf.st_mode))
+        {
+            // Copy regular file
+            int srcFd = open(srcPath, O_RDONLY | O_CLOEXEC);
+            if (srcFd < 0)
+            {
+                Log("Failed to open source file %s: %s", srcPath, strerror(errno));
+                success = false;
+                continue;
+            }
+
+            int destFd = open(destPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, statbuf.st_mode);
+            if (destFd < 0)
+            {
+                Log("Failed to open destination file %s: %s", destPath, strerror(errno));
+                close(srcFd);
+                success = false;
+                continue;
+            }
+
+            char buffer[8192];
+            ssize_t bytesRead;
+            bool copySuccess = true;
+
+            while ((bytesRead = read(srcFd, buffer, sizeof(buffer))) > 0)
+            {
+                ssize_t bytesWritten = write(destFd, buffer, bytesRead);
+                if (bytesWritten != bytesRead)
+                {
+                    Log("Failed to write to %s: %s", destPath, strerror(errno));
+                    copySuccess = false;
+                    success = false;
+                    break;
+                }
+            }
+
+            if (bytesRead < 0)
+            {
+                Log("Failed to read from %s: %s", srcPath, strerror(errno));
+                success = false;
+            }
+
+            close(srcFd);
+            close(destFd);
+
+            if (!copySuccess)
+            {
+                continue;
+            }
+
+            // Preserve timestamps
+            struct timespec times[2];
+            times[0] = statbuf.st_atim;
+            times[1] = statbuf.st_mtim;
+            if (utimensat(AT_FDCWD, destPath, times, 0) != 0)
+            {
+                Log("Warning: Failed to preserve timestamps for %s: %s", destPath, strerror(errno));
+            }
+        }
+    }
+
+    closedir(dir);
+
+    if (success)
+    {
+        Log("Successfully copied directory %s to %s", src, dest);
+    }
+
+    return success;
+}
+
+/**
+ * @brief Write content to a file
+ * 
+ * @param path Path to the file
+ * @param content Content to write
+ * @param append If true, append to file; if false, overwrite
+ * @return true if successful, false otherwise
+ */
+static bool writeFile(const char *path, const char *content, bool append = false)
+{
+    int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+    if (append)
+    {
+        flags |= O_APPEND;
+    }
+    else
+    {
+        flags |= O_TRUNC;
+    }
+
+    int fd = open(path, flags, 0644);
+    if (fd < 0)
+    {
+        Log("Failed to open file %s for writing: %s", path, strerror(errno));
+        return false;
+    }
+
+    size_t contentLen = strlen(content);
+    ssize_t bytesWritten = write(fd, content, contentLen);
+
+    if (bytesWritten < 0)
+    {
+        Log("Failed to write to file %s: %s", path, strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    if ((size_t)bytesWritten != contentLen)
+    {
+        Log("Incomplete write to file %s: wrote %zd of %zu bytes", path, bytesWritten, contentLen);
+        close(fd);
+        return false;
+    }
+
+    if (fsync(fd) != 0)
+    {
+        Log("Warning: Failed to sync file %s: %s", path, strerror(errno));
+    }
+
+    close(fd);
+    Log("Successfully wrote to file: %s", path);
+    return true;
+}
 
 /**
  * References:
@@ -600,44 +953,114 @@ std::string ProcessMonitor::getSystemdService(pid_t pid)
 
 bool ProcessMonitor::setupMemPreload()
 {
-    if (!gCaptureMemData) {
+    if (!gCaptureMemData)
+    {
         return true;
     }
-    if (gMemPreloadLib.empty()) {
+    if (gMemPreloadLib.empty())
+    {
         Log("Memory preload requested but no library path provided");
         return false;
     }
 
-    Log("Preparing bind-mounted /etc for memory preload");
+    Log("Preparing bind-mounted %s for memory preload", ETC_DIR);
 
-    if (!runShellCommand("/bin/rm -rf /media/apps/etc"))
+    char mountEtcPath[PATH_MAX];
+    int ret = snprintf(mountEtcPath, sizeof(mountEtcPath), "%s%s", MOUNT_DIR, ETC_DIR);
+    Log("Mount etc path: %s", mountEtcPath);
+    if (ret < 0 || ret >= (int)sizeof(mountEtcPath))
     {
-        Log("Failed to clear /media/apps/etc");
+        Log("Mount path too long");
         return false;
     }
 
-    if (!runShellCommand("/bin/mkdir -p /media/apps/etc"))
+    // Clear existing mount directory
+    if (!clearDirectory(mountEtcPath))
     {
-        Log("Failed to create /media/apps/etc");
+        Log("Failed to clear %s", mountEtcPath);
+        // Continue anyway as directory might not exist
+    }
+
+    // Remove the directory itself if it exists
+    if (rmdir(mountEtcPath) != 0 && errno != ENOENT)
+    {
+        Log("Warning: Failed to remove %s: %s", mountEtcPath, strerror(errno));
+    }
+
+    // Create mount directory
+    if (!createDirectory(mountEtcPath))
+    {
+        Log("Failed to create %s", mountEtcPath);
+        return false;
+    }
+    Log("Successfully created mount directory: %s", mountEtcPath);
+
+    // Copy /etc to mount directory
+    if (!copyDirectory(ETC_DIR, mountEtcPath))
+    {
+        Log("Failed to copy %s to %s", ETC_DIR, mountEtcPath);
+        clearDirectory(mountEtcPath);
+        rmdir(mountEtcPath);
+        return false;
+    }
+    Log("Successfully copied %s to %s", ETC_DIR, mountEtcPath);
+
+    // Bind mount using mount-copybind
+    char mountCmd[PATH_MAX * 2 + 64];
+    ret = snprintf(mountCmd, sizeof(mountCmd), "/sbin/mount-copybind %s %s", mountEtcPath, ETC_DIR);
+    if (ret < 0 || ret >= (int)sizeof(mountCmd))
+    {
+        Log("Mount command too long");
+        clearDirectory(mountEtcPath);
+        rmdir(mountEtcPath);
         return false;
     }
 
-    if (!runShellCommand("/bin/cp -a /etc /media/apps/etc")) {
-        Log("Failed to copy /etc into /media/apps/etc");
+    Log("Running mount command: %s", mountCmd);
+    int rc = std::system(mountCmd);
+    if (rc != 0)
+    {
+        if (rc == -1)
+        {
+            Log("Failed to execute mount command: %s", strerror(errno));
+        }
+        else
+        {
+            Log("Mount command returned non-zero status: %d", rc);
+        }
+        clearDirectory(mountEtcPath);
+        rmdir(mountEtcPath);
+        return false;
+    }
+    Log("Successfully bind-mounted %s onto %s", mountEtcPath, ETC_DIR);
+
+    // Write preload library to /etc/ld.so.preload
+    char preloadPath[PATH_MAX];
+    ret = snprintf(preloadPath, sizeof(preloadPath), "%s/ld.so.preload", ETC_DIR);
+    if (ret < 0 || ret >= (int)sizeof(preloadPath))
+    {
+        Log("Preload path too long");
+        // Cleanup: unmount before returning
+        if (int umountRc = std::system("/bin/umount /etc"); umountRc != 0)
+        {
+            Log("Failed to umount %s during cleanup: status=%d", ETC_DIR, umountRc);
+        }
+        clearDirectory(mountEtcPath);
+        rmdir(mountEtcPath);
         return false;
     }
 
-    if (!runShellCommand("/sbin/mount-copybind /media/apps/etc /etc")) {
-        Log("Failed to bind-mount /media/apps/etc onto /etc");
-        runShellCommand("/bin/rm -rf /media/apps/etc");
-        return false;
-    }
-
-    std::string cmd = "/bin/sh -c '/bin/echo " + gMemPreloadLib + " > /etc/ld.so.preload'";
-    if (!runShellCommand(cmd)) {
-        Log("Failed to write preload library to /etc/ld.so.preload");
-        runShellCommand("/bin/umount /etc");
-        runShellCommand("/bin/rm -rf /media/apps/etc");
+    std::string preloadContent = gMemPreloadLib + "\n";
+    if (!writeFile(preloadPath, preloadContent.c_str(), false))
+    {
+        Log("Failed to write preload library to %s", preloadPath);
+        // Cleanup: unmount before returning
+        if (int umountRc = std::system("/bin/umount /etc"); umountRc != 0)
+        {
+            Log("Failed to umount %s during cleanup: status=%d", ETC_DIR, umountRc);
+        }
+        clearDirectory(mountEtcPath);
+        rmdir(mountEtcPath);
         return false;
     }
 
@@ -653,47 +1076,69 @@ void ProcessMonitor::teardownMemPreload()
         return;
     }
 
-    Log("Tearing down bind-mounted /etc for memory preload");
+    Log("Tearing down bind-mounted %s for memory preload", ETC_DIR);
 
-    if (!runShellCommand("/bin/umount /etc"))
+    // Unmount /etc
+    Log("Unmounting %s", ETC_DIR);
+    int umountRc = std::system("/bin/umount /etc");
+    if (umountRc != 0)
     {
-        Log("Failed to unmount /etc; manual cleanup required");
+        if (umountRc == -1)
+        {
+            Log("Failed to execute umount command: %s", strerror(errno));
+        }
+        else
+        {
+            Log("Umount command returned non-zero status: %d", umountRc);
+        }
+        Log("Manual cleanup required for %s", ETC_DIR);
+        mMemPreloadActive = false;
+        return;
+    }
+    Log("Successfully unmounted %s", ETC_DIR);
+
+    // Clean up mount directory
+    char mountEtcPath[PATH_MAX];
+    int ret = snprintf(mountEtcPath, sizeof(mountEtcPath), "%s/etc", MOUNT_DIR);
+    if (ret < 0 || ret >= (int)sizeof(mountEtcPath))
+    {
+        Log("Mount path too long");
+        mMemPreloadActive = false;
         return;
     }
 
-    if (!runShellCommand("/bin/rm -rf /media/apps/etc"))
+    // Clear out the mount directory
+    if (!clearDirectory(mountEtcPath))
     {
-        Log("Failed to remove /media/apps/etc; manual cleanup required");
+        Log("Failed to clear %s; manual cleanup required", mountEtcPath);
     }
 
-    if (!runShellCommand("/bin/sh -c '> /etc/ld.so.preload'"))
+    if (rmdir(mountEtcPath) != 0)
     {
-        Log("Warning: failed to clear /etc/ld.so.preload");
-    }
-
-    mMemPreloadActive = false;
-}
-
-bool ProcessMonitor::runShellCommand(const std::string &command) const
-{
-    Log("Running command: %s", command.c_str());
-
-    int rc = std::system(command.c_str());
-    if (rc == 0)
-    {
-        Log("Command succeeded: %s", command.c_str());
-        return true;
-    }
-
-    if (rc == -1)
-    {
-        Log("Command failed to start: %s (errno=%d, %s)", command.c_str(), errno, strerror(errno));
+        Log("Failed to remove %s: %s; manual cleanup required", mountEtcPath, strerror(errno));
     }
     else
     {
-        Log("Command returned non-zero: %s (status=%d)", command.c_str(), rc);
+        Log("Successfully removed %s", mountEtcPath);
     }
-    return false;
+
+    // Clear /etc/ld.so.preload
+    char preloadPath[PATH_MAX];
+    ret = snprintf(preloadPath, sizeof(preloadPath), "%s/ld.so.preload", ETC_DIR);
+    if (ret < 0 || ret >= (int)sizeof(preloadPath))
+    {
+        Log("Preload path too long");
+    }
+    else
+    {
+        if (!writeFile(preloadPath, "", false))
+        {
+            Log("Warning: failed to clear %s", preloadPath);
+        }
+    }
+
+    mMemPreloadActive = false;
+    Log("Memory preload teardown complete");
 }
 
 void ProcessMonitor::mergeExitHandlerData()
